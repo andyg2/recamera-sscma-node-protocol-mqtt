@@ -4,13 +4,10 @@ import json
 import uuid
 import numpy as np
 from collections import defaultdict
-
-
-import numpy as np
+from collections import deque
 import cv2
 import base64
-
-import numpy as np
+message_times = deque(maxlen=100)  # Store last 100 timestamps
 
 class KalmanFilter:
     def __init__(self, initial_state, dt=1.0, process_noise=1.0, measurement_noise=1.0):
@@ -324,33 +321,76 @@ def cleanup_old_filters(expiry_time=30):
         del kalman_filters[key]
         print(f"Removed ID {key} due to inactivity.")
 
+def generate_oval_mask(width, height):
+    """Creates an oval-shaped quadratic dropoff mask with exact ROI size."""
+    Y, X = np.ogrid[:height, :width]
+
+    # Compute normalized distances (ellipse formula)
+    normalized_x = ((X - width / 2) / (width / 2)) ** 2
+    normalized_y = ((Y - height / 2) / (height / 2)) ** 2
+
+    # Quadratic dropoff
+    normalized_distance = np.sqrt(normalized_x + normalized_y)
+    mask = np.clip(1 - normalized_distance ** 2, 0, 1)
+
+    # Convert to 8-bit grayscale (0-255) and ensure single-channel
+    mask = (mask * 255).astype(np.uint8)
+
+    return mask  # Shape: (height, width), dtype: uint8
+
 def model_message_handler(payload):
-    global next_id, kalman_filters
-    hist_score = 1;
+    global next_id, kalman_filters, message_times
+    hist_score = 1
+    
+    now = time.time()
+    message_times.append(now)  # Log message arrival time
+    
+    # Compute message rate
+    rate = 0
+    if len(message_times) > 1:
+        interval = now - message_times[0]  # Time difference between first and last message
+        rate = len(message_times) / interval if interval > 0 else 0  # Avoid division by zero
+
+    # print(f"[MQTT] Incoming Message Rate: {rate:.2f} messages/sec")
+
+    start_time = time.time()  # Start processing timer
+
+
     # Remove old filters before processing new data
     cleanup_old_filters(expiry_time=30)
 
     if "data" in payload and isinstance(payload["data"], dict) and "boxes" in payload["data"]:
         image = payload["data"]["image"]
-        
+
         # Decode base64 image
         image = base64.b64decode(image)
         image = np.frombuffer(image, dtype=np.uint8)
         image = cv2.imdecode(image, cv2.IMREAD_COLOR)
-        
+
         boxes = payload["data"]["boxes"]
         resolution = payload["data"]["resolution"]
 
         for box in boxes:
             x, y, w, h, confidence, class_id = box
-            
-            # Extract region of interest and compute histogram
+
+            # Extract region of interest (ROI)
             roi = image[y:y + h, x:x + w]
+
+            # Generate oval-shaped quadratic dropoff mask for the bounding box
+            mask = generate_oval_mask(w, h)
             
-            # histogram format: [0-255, 0-255, 0-255]
-            histogram = cv2.calcHist([roi], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+            # Ensure the mask matches ROI dimensions
+            if roi.shape[:2] != mask.shape:
+                # print(f"Resizing mask: ROI {roi.shape[:2]}, Mask {mask.shape}")
+                mask = cv2.resize(mask, (roi.shape[1], roi.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+            # Ensure mask is single-channel (uint8)
+            if mask.ndim == 3:
+                mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+
+            # Compute histogram with the mask
+            histogram = cv2.calcHist([roi], [0, 1, 2], mask, [8, 8, 8], [0, 256, 0, 256, 0, 256])
             histogram = cv2.normalize(histogram, histogram).flatten()
-            print(histogram)
             
             # Compute bounding box center
             center_x = x + (w / 2)
@@ -396,6 +436,18 @@ def model_message_handler(payload):
             )
 
             print(f"Entry with count {payload['data']['count']}: ID {matched_id}, Hist {hist_score}")
+            
+    end_time = time.time()
+    processing_time = end_time - start_time  # Time taken to process the message
+
+    # print(f"[MQTT] Message processed in {processing_time:.3f} sec (Rate: {rate:.3f} messages/sec)")
+
+    # **Better Check for Falling Behind**
+    if len(message_times) > 1:
+        avg_time_between_messages = (message_times[-1] - message_times[0]) / (len(message_times) - 1)
+        if processing_time > avg_time_between_messages:
+            print("[WARNING] Processing is slower than incoming messages! Falling behind.")
+            
 # Initialize global variables
 next_id = 0
 kalman_filters = {}  # Dictionary to store Kalman filters and their histograms
