@@ -445,6 +445,10 @@ def model_message_handler(payload):
     # **Better Check for Falling Behind**
     if len(message_times) > 1:
         avg_time_between_messages = (message_times[-1] - message_times[0]) / (len(message_times) - 1)
+
+        # if processing_time > 0:
+        #   print(f"Message Capacity:{avg_time_between_messages/processing_time:.3f}")
+        
         if processing_time > avg_time_between_messages:
             print("[WARNING] Processing is slower than incoming messages! Falling behind.")
             
