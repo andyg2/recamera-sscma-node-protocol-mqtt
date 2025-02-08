@@ -346,8 +346,11 @@ def model_message_handler(payload):
             
             # Extract region of interest and compute histogram
             roi = image[y:y + h, x:x + w]
+            
+            # histogram format: [0-255, 0-255, 0-255]
             histogram = cv2.calcHist([roi], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
             histogram = cv2.normalize(histogram, histogram).flatten()
+            print(histogram)
             
             # Compute bounding box center
             center_x = x + (w / 2)
