@@ -10,48 +10,103 @@ import base64
 message_times = deque(maxlen=100)  # Store last 100 timestamps
 
 class KalmanFilter:
-    def __init__(self, initial_state, dt=1.0, process_noise=1.0, measurement_noise=1.0):
-        self.state = np.array(initial_state, dtype=np.float32)  # Ensure it's always 4D
-        self.dt = dt  # Time step
+    def __init__(self, initial_state, dt=0.1, process_noise=1.0, measurement_noise=1.0):
+        self.state = np.array(initial_state, dtype=np.float32)
+        self.dt = dt
+        
+        # Increase process noise for velocity components
         self.process_noise = process_noise
         self.measurement_noise = measurement_noise
-
-        # State transition matrix
-        self.F = np.array([[1, 0, dt, 0], 
-                           [0, 1, 0, dt], 
-                           [0, 0, 1, 0], 
-                           [0, 0, 0, 1]], dtype=np.float32)
-
-        # Measurement matrix (position only)
-        self.H = np.array([[1, 0, 0, 0], 
-                           [0, 1, 0, 0]], dtype=np.float32)
-
-        # Process noise covariance
-        self.Q = np.array([[1, 0, 0, 0],
-                           [0, 1, 0, 0],
-                           [0, 0, 0.01, 0],
-                           [0, 0, 0, 0.01]], dtype=np.float32)
-
+        
+        # State transition matrix with more emphasis on velocity
+        self.F = np.array([
+            [1, 0, dt, 0],    # x = x + dx*dt
+            [0, 1, 0, dt],    # y = y + dy*dt
+            [0, 0, 1, 0],     # dx = dx
+            [0, 0, 0, 1]      # dy = dy
+        ], dtype=np.float32)
+        
+        # Measurement matrix (we only observe position)
+        self.H = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
+        ], dtype=np.float32)
+        
+        # Process noise covariance - increased for velocity components
+        self.Q = np.array([
+            [dt**4/4, 0, dt**3/2, 0],
+            [0, dt**4/4, 0, dt**3/2],
+            [dt**3/2, 0, dt**2, 0],
+            [0, dt**3/2, 0, dt**2]
+        ], dtype=np.float32) * process_noise
+        
         # Measurement noise covariance
         self.R = np.eye(2, dtype=np.float32) * measurement_noise
-
-        # Covariance matrix (set high for better stability)
-        self.P = np.eye(4, dtype=np.float32) * 500
-
+        
+        # Initial covariance matrix
+        self.P = np.array([
+            [10, 0, 0, 0],    # High uncertainty in position
+            [0, 10, 0, 0],
+            [0, 0, 1000, 0],  # Very high uncertainty in velocity
+            [0, 0, 0, 1000]
+        ], dtype=np.float32)
+        
+        # Track time since last update
+        self.last_update_time = time.time()
+    
     def predict(self):
+        # Update dt based on actual time elapsed
+        current_time = time.time()
+        self.dt = current_time - self.last_update_time
+        
+        # Update state transition matrix with new dt
+        self.F[0, 2] = self.dt
+        self.F[1, 3] = self.dt
+        
+        # Update process noise covariance with new dt
+        self.Q = np.array([
+            [self.dt**4/4, 0, self.dt**3/2, 0],
+            [0, self.dt**4/4, 0, self.dt**3/2],
+            [self.dt**3/2, 0, self.dt**2, 0],
+            [0, self.dt**3/2, 0, self.dt**2]
+        ], dtype=np.float32) * self.process_noise
+        
+        # Predict next state
         self.state = self.F @ self.state
         self.P = self.F @ self.P @ self.F.T + self.Q
-        return self.state[:2]  # Return predicted position (x, y)
-
+        
+        return self.state[:2]  # Return predicted position
+    
     def update(self, measurement):
-        y = measurement - self.H @ self.state  # ✅ Corrected line
+        # Innovation (measurement residual)
+        y = measurement - self.H @ self.state
+        
+        # Innovation covariance
         S = self.H @ self.P @ self.H.T + self.R
+        
+        # Kalman gain
         K = self.P @ self.H.T @ np.linalg.inv(S)
-        self.state = self.state + K @ y  # Update full state
+        
+        # Update state and covariance
+        self.state = self.state + K @ y
         self.P = (np.eye(4, dtype=np.float32) - K @ self.H) @ self.P
+        
+        # Update timestamp
+        self.last_update_time = time.time()
+    
+    def get_state(self):
+        """Return full state including velocity"""
+        return self.state
+    
+    def get_velocity(self):
+        """Return current velocity estimate"""
+        return self.state[2:]
+    
+    def get_position_uncertainty(self):
+        """Return uncertainty in position estimate"""
+        return np.sqrt(np.diag(self.P)[:2])
+      
 
-        
-        
 # Function to convert bounding box to grid number
 def convert_to_grid(box, resolution):
     grid_size = 68
@@ -338,119 +393,135 @@ def generate_oval_mask(width, height):
 
     return mask  # Shape: (height, width), dtype: uint8
 
+def predict_trajectory(kf, velocity, time_delta):
+    state = kf.get_state()
+    return state[:2] + velocity * time_delta
+
+
+def handle_occlusion(kalman_filters, now, max_age=2.0):
+    """Handle temporary occlusions by keeping trackers alive longer"""
+    for obj_id, (kf, hist, last_seen, size, velocity) in list(kalman_filters.items()):
+        time_unseen = now - last_seen
+        if time_unseen > max_age:
+            del kalman_filters[obj_id]
+        elif time_unseen > 0.5:  # Partially occluded
+            # Predict new position but don't update
+            kf.predict()
+def update_appearance_model(old_hist, new_hist, learning_rate=0.3):
+    """Gradually update appearance model"""
+    return old_hist * (1 - learning_rate) + new_hist * learning_rate
+
 def model_message_handler(payload):
     global next_id, kalman_filters, message_times
-    hist_score = 1
     
     now = time.time()
-    message_times.append(now)  # Log message arrival time
+    message_times.append(now)
     
-    # Compute message rate
-    rate = 0
-    if len(message_times) > 1:
-        interval = now - message_times[0]  # Time difference between first and last message
-        rate = len(message_times) / interval if interval > 0 else 0  # Avoid division by zero
-
-    # print(f"[MQTT] Incoming Message Rate: {rate:.2f} messages/sec")
-
-    start_time = time.time()  # Start processing timer
-
-
-    # Remove old filters before processing new data
-    cleanup_old_filters(expiry_time=30)
-
     if "data" in payload and isinstance(payload["data"], dict) and "boxes" in payload["data"]:
         image = payload["data"]["image"]
-
-        # Decode base64 image
         image = base64.b64decode(image)
         image = np.frombuffer(image, dtype=np.uint8)
         image = cv2.imdecode(image, cv2.IMREAD_COLOR)
-
         boxes = payload["data"]["boxes"]
         resolution = payload["data"]["resolution"]
-
+        
+        # Track matches to prevent duplicate assignments
+        used_trackers = set()
+        
         for box in boxes:
             x, y, w, h, confidence, class_id = box
-
-            # Extract region of interest (ROI)
             roi = image[y:y + h, x:x + w]
-
-            # Generate oval-shaped quadratic dropoff mask for the bounding box
-            mask = generate_oval_mask(w, h)
             
-            # Ensure the mask matches ROI dimensions
+            # Add size check tolerance
+            area = w * h
+            
+            # Compute histogram with mask
+            mask = generate_oval_mask(w, h)
             if roi.shape[:2] != mask.shape:
-                # print(f"Resizing mask: ROI {roi.shape[:2]}, Mask {mask.shape}")
-                mask = cv2.resize(mask, (roi.shape[1], roi.shape[0]), interpolation=cv2.INTER_NEAREST)
-
-            # Ensure mask is single-channel (uint8)
+                mask = cv2.resize(mask, (roi.shape[1], roi.shape[0]))
             if mask.ndim == 3:
                 mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
-
-            # Compute histogram with the mask
+                
             histogram = cv2.calcHist([roi], [0, 1, 2], mask, [8, 8, 8], [0, 256, 0, 256, 0, 256])
             histogram = cv2.normalize(histogram, histogram).flatten()
             
-            # Compute bounding box center
             center_x = x + (w / 2)
             center_y = y + (h / 2)
             measurement = np.array([center_x, center_y])
-
-            # Try to match with an existing object
+            
             matched_id = None
-            min_distance = float('inf')
-            best_match_score = float('inf')
-
-            for obj_id, (kf, obj_hist, last_seen) in kalman_filters.items():
+            min_score = float('inf')
+            
+            # Scoring system for matching
+            for obj_id, (kf, obj_hist, last_seen, obj_size, velocity) in kalman_filters.items():
+                if obj_id in used_trackers:
+                    continue
+                    
                 predicted_position = kf.predict()
+                
+                # Calculate various similarity metrics
                 distance = np.linalg.norm(measurement - predicted_position)
-
-                # Compare histograms
                 hist_score = compare_histograms(histogram, obj_hist)
-
-                # If the object is close and histograms are similar, match it
-                if distance < (w/5) and hist_score < 0.75:
-                    if distance < min_distance and hist_score < best_match_score:
-                        min_distance = distance
-                        best_match_score = hist_score
+                size_ratio = abs(area - obj_size) / max(area, obj_size)
+                time_since_last_seen = now - last_seen
+                
+                # Predicted position based on velocity
+                expected_position = predicted_position + velocity * time_since_last_seen
+                velocity_score = np.linalg.norm(measurement - expected_position)
+                
+                # Combined score with weights
+                total_score = (
+                    distance * 0.4 +  # Position weight
+                    hist_score * 0.3 +  # Appearance weight
+                    size_ratio * 0.2 +  # Size consistency weight
+                    velocity_score * 0.1  # Motion prediction weight
+                )
+                
+                # Thresholds for matching
+                if (distance < w/4 and  # Stricter distance threshold
+                    hist_score < 0.75 and 
+                    size_ratio < 0.3 and  # Allow 30% size difference
+                    time_since_last_seen < 1.0):  # Recent enough
+                    
+                    if total_score < min_score:
+                        min_score = total_score
                         matched_id = obj_id
-
-            # If no match, create a new tracking entry
-            if matched_id is None:
+            
+            if matched_id is not None:
+                # Update tracker
+                kf = kalman_filters[matched_id][0]
+                current_velocity = measurement - kf.get_state()[:2]
+                
+                # Update Kalman filter
+                kf.update(measurement)
+                
+                # Exponential moving average for velocity
+                alpha = 0.7  # Smoothing factor
+                new_velocity = alpha * current_velocity + (1 - alpha) * kalman_filters[matched_id][4]
+                
+                # Update tracker info
+                kalman_filters[matched_id] = (
+                    kf, 
+                    histogram,  # Update histogram
+                    now,  # Update timestamp
+                    area,  # Update size
+                    new_velocity  # Update velocity
+                )
+                used_trackers.add(matched_id)
+            else:
+                # Create new tracker
                 matched_id = next_id
                 next_id += 1
-                kalman_filters[matched_id] = (KalmanFilter(np.array([center_x, center_y, 0, 0])), histogram, time.time())
-
-            # Update Kalman filter with the new measurement
-            kalman_filters[matched_id][0].update(measurement)
-
-            # Refresh last seen timestamp
-            kalman_filters[matched_id] = (kalman_filters[matched_id][0], histogram, time.time())
-
-            # Convert predicted position to grid coordinates
-            predicted_position = kalman_filters[matched_id][0].predict()
-            grid_number = convert_to_grid(
-                [predicted_position[0], predicted_position[1], w, h, confidence, class_id],
-                resolution,
-            )
-
-            print(f"Entry with count {payload['data']['count']}: ID {matched_id}, Hist {hist_score}")
+                kalman_filters[matched_id] = (
+                    KalmanFilter(np.array([center_x, center_y, 0, 0])),
+                    histogram,
+                    now,
+                    area,
+                    np.array([0, 0])  # Initial velocity
+                )
             
-    end_time = time.time()
-    processing_time = end_time - start_time  # Time taken to process the message
-
-    # print(f"[MQTT] Message processed in {processing_time:.3f} sec (Rate: {rate:.3f} messages/sec)")
-
-    # **Better Check for Falling Behind**
-    if len(message_times) > 1:
-        avg_time_between_messages = (message_times[-1] - message_times[0]) / (len(message_times) - 1)
-
-        # if processing_time > 0:
-        #   print(f"Message Capacity:{avg_time_between_messages/processing_time:.3f}")
-        
-        if processing_time > avg_time_between_messages:
-            print("[WARNING] Processing is slower than incoming messages! Falling behind.")
+            print(f"Entry {payload['data']['count']}: ID {matched_id}, Score {min_score if matched_id in used_trackers else 'new'}")
+            
             
 # Initialize global variables
 next_id = 0
